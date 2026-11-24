@@ -1,7 +1,6 @@
 import os
 import re
 import io
-import math
 import tempfile
 import openpyxl
 import pypdf
@@ -10,11 +9,26 @@ from PIL import Image, ImageSequence
 import streamlit as st
 
 st.set_page_config(
-    page_title="Validador de Precalificación CUB",
-    page_icon="📊",
+    page_title="Autocontrol de Precalificación CUB",
+    page_icon="🛡️",
     layout="wide"
 )
 
+# Control de llave para reiniciar los cargadores de archivos al limpiar sesión
+if "uploader_key" not in st.session_state:
+    st.session_state["uploader_key"] = 0
+if "resultado_auditoria" not in st.session_state:
+    st.session_state["resultado_auditoria"] = None
+
+
+def limpiar_memoria_y_reiniciar():
+    st.session_state["resultado_auditoria"] = None
+    st.session_state["uploader_key"] += 1
+
+
+# -------------------------------------------------------------------------
+# MOTOR DE LECTURA Y AUDITORÍA NORMATIVA (CUB ANEXOS 20, 21 Y 22)
+# -------------------------------------------------------------------------
 def convertir_vaciado_pdf_a_workbook(ruta_pdf):
     wb_virtual = openpyxl.Workbook()
     ws_res = wb_virtual.active
@@ -145,233 +159,28 @@ def escribir_celda_segura(ws, fila, col, valor):
     ws.cell(fila, col).value = valor
 
 
-def simular_escenario_desde_comentario(wb_valores, hoja_activa, sector_eval, comentario_analista):
-    txt = comentario_analista.strip()
-    if not txt:
-        return None
-    ws_m = wb_valores[hoja_activa]
-    fecha_bc = str(ws_m["C5"].value or "")[:10]
-    calif_act = str(ws_m["G11"].value or "").strip()
-    res_act_val = ws_m["G10"].value
-    res_act_txt = f"{float(res_act_val)*100:.2f}%" if isinstance(res_act_val, (int, float)) else str(res_act_val or "")
-
-    fila_enc = 26 if "Corporativos" in hoja_activa else 25
-    col_rango = None
-    for c in range(1, ws_m.max_column + 1):
-        if sector_eval.lower()[:6] in str(ws_m.cell(fila_enc, c).value or "").lower():
-            col_rango = c
-            break
-    if not col_rango:
-        return None
-
-    col_num = col_rango - 2
-    col_pts = col_rango + 4
-    low = txt.lower()
-
-    def max_pts_tabla(f_ini):
-        m_pts = -9999
-        rt = f_ini
-        while ws_m.cell(rt, col_rango).value is not None:
-            op = str(ws_m.cell(rt, col_rango).value).lower()
-            p = ws_m.cell(rt, col_rango + 1).value
-            if isinstance(p, (int, float)) and "sin informaci" not in op and p > m_pts:
-                m_pts = p
-            rt += 1
-        return m_pts if m_pts > -9999 else 0
-
-    filas_1a = [r for r in range(26, 44) if ws_m.cell(r, col_num).value in [1, 2, 3, 1.0, 2.0, 3.0]]
-    ganancias_1a = {}
-    for r_ind in filas_1a:
-        num_i = int(ws_m.cell(r_ind, col_num).value)
-        pts_actual = float(ws_m.cell(r_ind, col_pts).value or 0)
-        pts_max = max_pts_tabla(r_ind)
-        ganancias_1a[num_i] = max(0.0, pts_max - pts_actual)
-
-    es_quita = any(k in low for k in ["quita", "castigo", "reestructura", "quitas"])
-    solo_no_bancos = any(k in low for k in ["no banc", "proveedor", "comercial", "bardahl"])
-    solo_bancos = any(k in low for k in ["banc", "banco", "tarjeta", "crédito bancario"])
-
-    if es_quita and 3 in ganancias_1a and ganancias_1a[3] > 0:
-        delta_puntos = ganancias_1a[3]
-        motivo_cambio = "la aclaración/eliminación de la clave de quita o reestructura en su buró"
-    elif solo_no_bancos and ganancias_1a.get(2, 0) > 0:
-        delta_puntos = ganancias_1a[2]
-        motivo_cambio = "la actualización de su buró y con ello se elimina el atraso presentado"
-    elif solo_bancos and ganancias_1a.get(1, 0) > 0:
-        delta_puntos = ganancias_1a[1]
-        motivo_cambio = "la actualización de su buró y con ello se elimina el atraso presentado"
-    else:
-        delta_puntos = sum(ganancias_1a.values())
-        motivo_cambio = "la actualización de su buró y con ello se elimina el atraso presentado"
-
-    if "Pymes" in hoja_activa:
-        puntaje_act = float(ws_m["T5"].value or 0)
-        peso_cuanti = 1.0
-    else:
-        fila_tot = 84
-        for r_chk in range(75, 90):
-            if "total de puntaje" in str(ws_m.cell(r_chk, col_rango + 1).value or "").lower():
-                fila_tot = r_chk
-                break
-        puntaje_act = float(ws_m.cell(fila_tot, col_pts).value or 0)
-        peso_cuanti = 0.85 if "mayores o iguales a 54" in str(ws_m["C14"].value or "").lower() else 1.0
-
-    puntaje_nuevo = puntaje_act + (delta_puntos * peso_cuanti)
-    pi_nueva = 1.0 / (1.0 + math.exp(-(500.0 - puntaje_nuevo) * (math.log(2.0) / 40.0)))
-    sp_val = float(ws_m["G6"].value or 0.55)
-    res_nueva_dec = pi_nueva * sp_val
-    res_nueva_pct = res_nueva_dec * 100.0
-
-    calif_nueva = calif_act
-    if "Grado de Riesgo" in wb_valores.sheetnames:
-        ws_gr = wb_valores["Grado de Riesgo"]
-        for rg in range(4, 13):
-            grado_txt = str(ws_gr.cell(rg, 1).value or "").strip()
-            lim_sup = ws_gr.cell(rg, 6).value
-            if grado_txt and isinstance(lim_sup, (int, float)):
-                if res_nueva_dec <= float(lim_sup) + 1e-7:
-                    calif_nueva = grado_txt
-                    break
-
-    return {
-        "fecha_bc": fecha_bc,
-        "calif_act": calif_act,
-        "res_act": res_act_txt,
-        "calif_nueva": calif_nueva,
-        "res_nueva": f"{res_nueva_pct:.2f}%",
-        "puntaje_act": round(puntaje_act, 1),
-        "puntaje_nuevo": round(puntaje_nuevo, 1),
-        "delta": round(delta_puntos, 1),
-        "motivo_cambio": motivo_cambio,
-    }
-
-
-def redactar_correo_alison(cliente_nombre, errores, ws_valores, esc_buro=None):
-    empresa_corta = re.sub(
-        r",?\s*(S\.?A\.?\s*de\s*C\.?V\.?|S\.?\s*de\s*R\.?L\.?\s*de\s*C\.?V\.?|S\.?A\.?P\.?I\.?\s*de\s*C\.?V\.?)",
-        "", cliente_nombre, flags=re.IGNORECASE
-    ).strip()
-
-    lineas_correo = [
-        f"Asunto: Validación precalificación - {empresa_corta}",
-        "",
-        "Hola [Nombre], buen día",
-        "",
-    ]
-
-    if not errores:
-        lineas_correo.append("La precalificación se llenó correctamente")
-        if esc_buro:
-            f_tag = f" consultada el {esc_buro['fecha_bc']}" if esc_buro["fecha_bc"] else ""
-            lineas_correo.append(
-                f"Sobre el tema que mencionas, considerando tal cual la información de buró{f_tag} que es la que me compartes, "
-                f"el cliente tendría una calificación de {esc_buro['calif_act']} con porcentaje de reserva del {esc_buro['res_act']}. "
-                f"Sin embargo, si se considera lo que comenta el ejecutivo sobre {esc_buro['motivo_cambio']}, "
-                f"el cliente tendría una calificación de {esc_buro['calif_nueva']} con porcentaje de reserva del {esc_buro['res_nueva']}."
-            )
-        else:
-            calif = str(ws_valores["G11"].value or "").strip()
-            res_val = ws_valores["G10"].value
-            res_txt = f"{float(res_val)*100:.2f}%" if isinstance(res_val, (int, float)) else str(res_val or "")
-            if calif and res_txt:
-                lineas_correo.append(f"La calificación es {calif} con un % reserva del {res_txt}.")
-        lineas_correo.extend(["", "Saludos."])
-        return "\n".join(lineas_correo)
-
-    lineas_correo.append("Adjunto precalificación junto con sus comentarios y/o modificaciones:")
-    lineas_correo.append("")
-
-    grupos = {"Datos Generales": [], "1A": [], "1B": [], "1C": [], "Cualitativos": [], "Otros": []}
-
-    def agregar_a_grupo(categoria, texto_item):
-        texto_limpio = texto_item.strip().rstrip(".")
-        if texto_limpio and texto_limpio not in grupos[categoria]:
-            grupos[categoria].append(texto_limpio)
-
-    for e in errores:
-        mot = e["motivo"]
-        fila_e = e.get("fila")
-        if "Sector" in mot and "C10" in mot:
-            agregar_a_grupo("Datos Generales", f"Sector ({e['nuevo_val']})")
-        elif "Celda G18" in mot:
-            agregar_a_grupo("Datos Generales", f"Ventas Netas (${float(e['nuevo_val']):,.2f})")
-        elif "Anexo Incorrecto" in mot:
-            agregar_a_grupo("Datos Generales", f"Pestaña normativa ({e['nuevo_val'] or 'Anexo correspondiente según UDIs'})")
-        elif "Factor 1-A" in mot:
-            if "No Bancos" in mot:
-                agregar_a_grupo("1A", "No Bancos")
-            elif "Bancos" in mot:
-                agregar_a_grupo("1A", "Bancos")
-            else:
-                agregar_a_grupo("1A", "Indicador de Buró")
-        elif "Factor 1-B" in mot:
-            m_1b = re.search(r"Factor 1-B \('([^']+)'\)", mot)
-            agregar_a_grupo("1B", m_1b.group(1) if m_1b else "Indicador de experiencia interna")
-        elif "1-C" in mot or (fila_e and 55 <= fila_e <= 85):
-            if "Insumo '" not in mot:
-                m_ind = re.search(r"'([^']+)'", mot)
-                agregar_a_grupo("1C", m_ind.group(1) if m_ind else "Indicador financiero")
-        elif fila_e and 94 <= fila_e <= 120:
-            if "F108" in mot or "auditad" in mot.lower():
-                agregar_a_grupo("Cualitativos", "Estados financieros auditados")
-            elif "F112" in mot or "gobierno" in mot.lower() or "organizacional" in mot.lower():
-                agregar_a_grupo("Cualitativos", "Estructura organizacional")
-            elif "F117" in mot or "accionaria" in mot.lower():
-                agregar_a_grupo("Cualitativos", "Composición accionaria")
-            else:
-                agregar_a_grupo("Cualitativos", mot)
-        else:
-            agregar_a_grupo("Otros", mot)
-
-    if grupos["Datos Generales"]:
-        lineas_correo.append(f"  • Datos Generales: {', '.join(grupos['Datos Generales'])}")
-    if grupos["1A"]:
-        if len(grupos["1A"]) >= 2:
-            lineas_correo.append("  • 1A: Ambos indicadores, se actualiza conforme a Buró de Crédito")
-        else:
-            lineas_correo.append(f"  • 1A ({grupos['1A'][0]}): se ajusta conforme a Buró de Crédito")
-    if grupos["1B"]:
-        if len(grupos["1B"]) >= 2:
-            lineas_correo.append("  • 1B: Ambos indicadores, se pone el mejor puntaje")
-        else:
-            lineas_correo.append(f"  • 1B ({grupos['1B'][0]}): se pone el mejor puntaje")
-    if grupos["1C"]:
-        lineas_correo.append(f"  • 1C: {', '.join(grupos['1C'])}")
-    if grupos["Cualitativos"]:
-        lineas_correo.append(f"  • Cualitativos: {', '.join(grupos['Cualitativos'])}")
-    for item_otro in grupos["Otros"]:
-        lineas_correo.append(f"  • {item_otro}")
-
-    if esc_buro:
-        f_tag = f" consultada el {esc_buro['fecha_bc']}" if esc_buro["fecha_bc"] else ""
-        lineas_correo.extend([
-            "",
-            f"Sobre el tema que mencionas, considerando tal cual la información de buró{f_tag}, el cliente tendría una calificación de "
-            f"{esc_buro['calif_act']} con porcentaje de reserva del {esc_buro['res_act']}. Sin embargo, si se considera lo que comenta "
-            f"el ejecutivo sobre {esc_buro['motivo_cambio']}, el cliente tendría una calificación de {esc_buro['calif_nueva']} con "
-            f"porcentaje de reserva del {esc_buro['res_nueva']}."
-        ])
-
-    lineas_correo.extend(["", "Saludos."])
-    return "\n".join(lineas_correo)
-
-
-def ejecutar_auditoria_completa(path_vac, path_buro, path_pre, path_tif, comentario_analista):
+def ejecutar_auditoria_analista(path_vac, path_buro, path_pre, path_tif):
     logs_pasos = []
     errores_llenado = []
-    alertas_sin_impacto = []
+    alertas_informativas = []
 
-    def registrar_error(hoja, fila, col, nuevo_val, motivo):
+    def registrar_error(bloque, celda_str, hoja, fila, col, val_actual, nuevo_val, motivo):
         for e in errores_llenado:
             if e["hoja"] == hoja and e["fila"] == fila and e["col"] == col and e["motivo"] == motivo:
                 return
-        errores_llenado.append({"hoja": hoja, "fila": fila, "col": col, "nuevo_val": nuevo_val, "motivo": motivo})
+        errores_llenado.append({
+            "bloque": bloque,
+            "celda": celda_str,
+            "hoja": hoja,
+            "fila": fila,
+            "col": col,
+            "val_actual": str(val_actual),
+            "nuevo_val": nuevo_val,
+            "motivo": motivo
+        })
 
-    if path_vac.lower().endswith(".pdf"):
-        wb_vac = convertir_vaciado_pdf_a_workbook(path_vac)
-    else:
-        wb_vac = openpyxl.load_workbook(path_vac, data_only=True)
-
+    # 1. Lectura de archivos
+    wb_vac = convertir_vaciado_pdf_a_workbook(path_vac) if path_vac.lower().endswith(".pdf") else openpyxl.load_workbook(path_vac, data_only=True)
     reader_bc = pypdf.PdfReader(path_buro)
     texto_buro_completo = "\n".join([(p.extract_text() or "") for p in reader_bc.pages])
 
@@ -390,6 +199,7 @@ def ejecutar_auditoria_completa(path_vac, path_buro, path_pre, path_tif, comenta
         wb_pre_val = openpyxl.load_workbook(path_pre, data_only=True)
         wb_pre_form = openpyxl.load_workbook(path_pre, data_only=False)
 
+    # 2. Detección de pestaña activa
     hoja_modelo = None
     for candidata in ["Pymes(Anexo 21)", "Corporativos(Anexo 22)", "Entidades Financieras(Anexo 20)"]:
         if candidata in wb_pre_val.sheetnames and wb_pre_val[candidata]["C6"].value not in [None, 0, "0", ""]:
@@ -401,17 +211,16 @@ def ejecutar_auditoria_completa(path_vac, path_buro, path_pre, path_tif, comenta
     ws_val = wb_pre_val[hoja_modelo]
     ws_form = wb_pre_form[hoja_modelo]
     nombre_cliente = str(ws_val["B4"].value or "Cliente").replace("Nombre:", "").strip()
-    logs_pasos.append(f"**[Paso 1]** Empresa detectada: `{nombre_cliente}` | Pestaña activa: `{hoja_modelo}`")
+    logs_pasos.append(f"**[Paso 1 — Pestaña]** Empresa: `{nombre_cliente}` | Pestaña evaluada: `{hoja_modelo}`")
 
+    # 3. Validación SCIAN y Sector
     tabla_scian = re.search(
         r"C[oó]digo\s+SCIAN\s+Descripci[oó]n(.*?)(?:Previsor|Mensajes|INFORMACI[OÓ]N CREDITICIA|Cr[eé]ditos Activos)",
         texto_buro_completo, re.DOTALL | re.IGNORECASE
     )
-    sectores_validos_buro = []
-    codigos_buro = []
+    sectores_validos_buro, codigos_buro = [], []
     if tabla_scian:
-        pares_scian = re.findall(r"\b(\d{5,6})\b", tabla_scian.group(1))
-        for cod in pares_scian:
+        for cod in re.findall(r"\b(\d{5,6})\b", tabla_scian.group(1)):
             sec_cub, _ = mapear_scian_a_sector_cub(cod)
             if sec_cub:
                 sectores_validos_buro.append(sec_cub)
@@ -424,19 +233,22 @@ def ejecutar_auditoria_completa(path_vac, path_buro, path_pre, path_tif, comenta
     sector_activo = sector_excel
 
     if not sector_excel:
-        msg = f"[Hoja: {hoja_modelo} | Celda C10] El campo 'Sector' está vacío."
-        registrar_error(hoja_modelo, 10, 3, sector_desde_codigo_excel or (sectores_validos_buro[0] if sectores_validos_buro else "Comercio"), msg)
+        sugerido = sector_desde_codigo_excel or (sectores_validos_buro[0] if sectores_validos_buro else "Comercio")
+        registrar_error("Datos Generales", "C10", hoja_modelo, 10, 3, "Vacío", sugerido, "El campo 'Sector' (C10) está vacío.")
     elif sector_desde_codigo_excel and sector_excel.lower() != sector_desde_codigo_excel.lower():
-        msg = f"[Hoja: {hoja_modelo} | Celda C10] Inconsistencia interna: C{fila_cod_excel} tiene '{codigo_excel_num}' ({sector_desde_codigo_excel}), pero C10 dice '{sector_excel}'."
-        registrar_error(hoja_modelo, 10, 3, sector_desde_codigo_excel, msg)
+        registrar_error(
+            "Datos Generales", "C10", hoja_modelo, 10, 3, sector_excel, sector_desde_codigo_excel,
+            f"Inconsistencia interna: en C{fila_cod_excel} capturaste el código '{codigo_excel_num}' ({sector_desde_codigo_excel}), pero en C10 elegiste '{sector_excel}'."
+        )
     elif sectores_validos_buro and sector_excel not in sectores_validos_buro:
-        logs_pasos.append(f"**[Paso 2 ⚠️]** Excel dice `{sector_excel}`, Buró reporta `{', '.join(codigos_buro)}` ({sectores_validos_buro[0]}). Se respeta Excel.")
+        alertas_informativas.append(f"Diferencia de Sector vs Buró: en Excel elegiste '{sector_excel}', mientras que el Buró reporta claves {', '.join(codigos_buro)} ({sectores_validos_buro[0]}). Verifica que el giro real de la empresa corresponda al sector capturado.")
     else:
-        logs_pasos.append(f"**[Paso 2 ✅]** Sector `{sector_activo}` validado correctamente.")
+        logs_pasos.append(f"**[Paso 2 — Sector]** Sector `{sector_activo}` consistente con claves SCIAN.")
 
+    # 4. Validación de Ventas Netas y UDIs
     hoja_edo_res = next((wb_vac[h] for h in wb_vac.sheetnames if h.strip().lower() in ["edo. res.", "edo res", "estado de resultados", "resultados"]), wb_vac[wb_vac.sheetnames[0]])
     fila_ventas = next((r for r in range(1, 20) if str(hoja_edo_res.cell(r, 1).value or "").strip().lower() in ["ventas netas", "ventas"]), None)
-    ventas_vac, col_periodo_res, fecha_periodo_res = None, None, ""
+    ventas_vac, col_periodo_res, fecha_periodo_res, es_dictaminado = None, None, "", False
 
     if fila_ventas:
         cols_anuales, cols_interinas = [], []
@@ -452,22 +264,32 @@ def ejecutar_auditoria_completa(path_vac, path_buro, path_pre, path_tif, comenta
         if col_periodo_res:
             ventas_vac = abs(float(hoja_edo_res.cell(fila_ventas, col_periodo_res).value))
             fecha_periodo_res = str(hoja_edo_res.cell(4, col_periodo_res).value)[:10]
+            es_dictaminado = "dictaminad" in str(hoja_edo_res.cell(5, col_periodo_res).value or "").lower()
 
     ventas_modelo = float(ws_val["G18"].value or 0)
     udi_modelo = float(ws_val["G19"].value or 0)
 
     if ventas_vac is not None:
         if abs(ventas_vac - ventas_modelo) > 1.5:
-            msg = f"[Hoja: {hoja_modelo} | Celda G18] Dice '{ventas_modelo:,.2f}', pero en Edo. Res. ({fecha_periodo_res}) reporta '{ventas_vac:,.2f}'."
-            registrar_error(hoja_modelo, 18, 7, round(ventas_vac, 2), msg)
+            registrar_error(
+                "Datos Generales", "G18", hoja_modelo, 18, 7, f"{ventas_modelo:,.2f}", round(ventas_vac, 2),
+                f"Ventas Netas en G18 dice '{ventas_modelo:,.2f}', pero en Edo. Res. ({fecha_periodo_res}) reporta '{ventas_vac:,.2f}'."
+            )
         if udi_modelo > 0:
             ventas_udis = ventas_vac / udi_modelo
             if ventas_udis < 14000 and "Corporativos" in hoja_modelo:
-                registrar_error(hoja_modelo, None, None, None, f"[Anexo Incorrecto] Equivale a {ventas_udis:,.2f} miles de UDIs (<14M). Debe usarse 'Pymes(Anexo 21)'.")
+                registrar_error(
+                    "Pestaña Normativa", "Hoja", hoja_modelo, None, None, hoja_modelo, "Pymes(Anexo 21)",
+                    f"Las ventas equivalen a {ventas_udis:,.2f} miles de UDIs (<14M UDIs). Debe llenarse la pestaña 'Pymes(Anexo 21)'."
+                )
             elif ventas_udis >= 14000 and "Pymes" in hoja_modelo:
-                registrar_error(hoja_modelo, None, None, None, f"[Anexo Incorrecto] Equivale a {ventas_udis:,.2f} miles de UDIs (>=14M). Debe usarse 'Corporativos(Anexo 22)'.")
-        logs_pasos.append(f"**[Paso 3]** Ventas Vaciado: `${ventas_vac:,.2f}` vs Modelo: `${ventas_modelo:,.2f}`.")
+                registrar_error(
+                    "Pestaña Normativa", "Hoja", hoja_modelo, None, None, hoja_modelo, "Corporativos(Anexo 22)",
+                    f"Las ventas equivalen a {ventas_udis:,.2f} miles de UDIs (>=14M UDIs). Debe llenarse la pestaña 'Corporativos(Anexo 22)'."
+                )
+        logs_pasos.append(f"**[Paso 3 — Ventas y UDIs]** Edo. Res. ({fecha_periodo_res}): `${ventas_vac:,.2f}` vs Modelo G18: `${ventas_modelo:,.2f}`.")
 
+    # 5. Factor 1-A (Buró), 1-B (Experiencia) y Cualitativos (.tif)
     def extraer_metrica_buro(nombre_campo, texto):
         m = re.search(rf"{nombre_campo}\s+(\d+(?:\.\d+)?)", texto)
         return float(m.group(1)) if m else None
@@ -502,9 +324,15 @@ def ejecutar_auditoria_completa(path_vac, path_buro, path_pre, path_tif, comenta
         mejor_nbk, pts_nbk = obtener_mejor_opcion_tabla(fila_1a_nbk, col_rango)
 
         if total_cred_bancarios > 0 and bk_sat == 1.0 and mejor_bk and sel_bk != mejor_bk:
-            registrar_error(hoja_modelo, fila_1a_bk, col_sel, mejor_bk, f"[Hoja: {hoja_modelo} | Celda {letra_sel}{fila_1a_bk}] Factor 1-A Bancos dice '{sel_bk}', debe ser '{mejor_bk}' ({pts_bk} pts).")
+            registrar_error(
+                "Factor 1-A (Buró)", f"{letra_sel}{fila_1a_bk}", hoja_modelo, fila_1a_bk, col_sel, sel_bk, mejor_bk,
+                f"Créditos Bancarios tiene '{sel_bk}', pero BK12_PCT_SAT = 1 (100% puntual). Debe ser '{mejor_bk}' ({pts_bk} pts)."
+            )
         if nbk_num > 0 and nbk_sat == 1.0 and mejor_nbk and sel_nbk != mejor_nbk:
-            registrar_error(hoja_modelo, fila_1a_nbk, col_sel, mejor_nbk, f"[Hoja: {hoja_modelo} | Celda {letra_sel}{fila_1a_nbk}] Factor 1-A No Bancos dice '{sel_nbk}', debe ser '{mejor_nbk}' ({pts_nbk} pts).")
+            registrar_error(
+                "Factor 1-A (Buró)", f"{letra_sel}{fila_1a_nbk}", hoja_modelo, fila_1a_nbk, col_sel, sel_nbk, mejor_nbk,
+                f"Créditos No Bancarios tiene '{sel_nbk}', pero NBK12_PCT_SAT = 1 (100% puntual). Debe ser '{mejor_nbk}' ({pts_nbk} pts)."
+            )
 
         filas_1b = [44, 50] if "Corporativos" in hoja_modelo else [48, 53, 54]
         for r_1b in filas_1b:
@@ -515,8 +343,28 @@ def ejecutar_auditoria_completa(path_vac, path_buro, path_pre, path_tif, comenta
                 mejor_op_1b, mejor_pts_1b = obtener_mejor_opcion_tabla(r_1b, col_rango)
                 pts_act_1b = ws_val.cell(r_1b, col_pts).value
                 if mejor_op_1b and sel_1b != mejor_op_1b and pts_act_1b != mejor_pts_1b:
-                    registrar_error(hoja_modelo, r_1b, col_sel, mejor_op_1b, f"[Hoja: {hoja_modelo} | Celda {letra_sel}{r_1b}] Factor 1-B ('{nom_ind}'): Tiene '{sel_1b}', debe ser '{mejor_op_1b}'.")
+                    registrar_error(
+                        "Factor 1-B (Experiencia)", f"{letra_sel}{r_1b}", hoja_modelo, r_1b, col_sel, sel_1b, mejor_op_1b,
+                        f"Indicador '{nom_ind}' tiene '{sel_1b}' ({pts_act_1b} pts). Conforme a política debe llevar '{mejor_op_1b}' ({mejor_pts_1b} pts)."
+                    )
+        logs_pasos.append(f"**[Paso 4 — Buró y Exp. Interna]** BK12_PCT_SAT={bk_sat} | NBK12_PCT_SAT={nbk_sat}.")
 
+    # Revisión de Gobierno Corporativo (.tif) en Corporativos
+    if "Corporativos" in hoja_modelo:
+        tiene_consejo = bool(re.search(r"consejo de administraci[oó]n|administrador [uú]nico|comisario|asamblea", texto_tif_completo, re.IGNORECASE))
+        accionista_33 = bool(re.search(r"([3-9][4-9]|[4-9]\d|100)\s*%", texto_tif_completo))
+        sel_aud = str(ws_val["F108"].value or "").strip()
+        sel_gob = str(ws_val["F112"].value or "").strip()
+        sel_acc = str(ws_val["F117"].value or "").strip()
+
+        if not es_dictaminado and "dos últimos años" in sel_aud.lower():
+            registrar_error("Cualitativos", "F108", hoja_modelo, None, None, sel_aud, "Revisar", "F108 dice que los EEFF son auditados los dos últimos años, pero el Vaciado no es dictaminado.")
+        if path_tif and tiene_consejo and ("no cuenta" in sel_gob.lower() or "débil" in sel_gob.lower()):
+            registrar_error("Cualitativos", "F112", hoja_modelo, None, None, sel_gob, "Revisar", "F112 indica estructura débil/sin gobierno, pero el .tif acredita órganos de administración.")
+        if path_tif and accionista_33 and "más del 33%" not in sel_acc.lower():
+            registrar_error("Cualitativos", "F117", hoja_modelo, None, None, sel_acc, "Revisar", "F117 no refleja concentración accionaria >33%, pero el .tif muestra participación superior al 33%.")
+
+    # 6. Factor 1-C (Razones Financieras en Corporativos)
     if "Corporativos" in hoja_modelo and col_sector_inicio:
         hoja_bal_gral = next((wb_vac[h] for h in wb_vac.sheetnames if h.strip().lower() in ["bal. gral.", "bal gral", "balance general"]), None)
         if hoja_bal_gral and col_periodo_res:
@@ -587,17 +435,35 @@ def ejecutar_auditoria_completa(path_vac, path_buro, path_pre, path_tif, comenta
                     if rango_esp and sel_act != rango_esp:
                         ind_err.add(r_ind)
                         coord_s = f"{openpyxl.utils.get_column_letter(col_sel)}{fila_sel}"
-                        registrar_error(hoja_modelo, fila_sel, col_sel, rango_esp, f"[Hoja: {hoja_modelo} | Celda {coord_s}] '{nom_ind}': Tiene '{sel_act}', debe ser '{rango_esp}'.")
+                        es_pct = "%" in rango_esp
+                        val_fmt = f"{val_calc*100:.2f}%" if es_pct else f"{val_calc:.2f}"
+                        registrar_error(
+                            "Factor 1-C (Financiero)", coord_s, hoja_modelo, fila_sel, col_sel, sel_act, rango_esp,
+                            f"Indicador '{nom_ind}' (cálculo real = {val_fmt}): tiene '{sel_act}', debe ser '{rango_esp}'."
+                        )
 
             for d in discrepancias:
                 if d["r_padre"] not in ind_err:
-                    alertas_sin_impacto.append(f"Celda {d['coord']} ({d['etiqueta']}): Excel={d['val_excel']:,.2f} vs Vaciado={d['val_v']:,.2f} (sin impacto en rango CUB).")
+                    alertas_informativas.append(f"Celda {d['coord']} ({d['etiqueta']}): capturaste {d['val_excel']:,.2f} vs Vaciado {d['val_v']:,.2f}. No altera puntaje ni calificación porque el ratio permanece en el mismo rango.")
                 else:
-                    registrar_error(hoja_modelo, d["fila"], d["col"], round(d["val_v"], 2), f"[Hoja: {hoja_modelo} | Celda {d['coord']}] Insumo '{d['etiqueta']}': Excel={d['val_excel']:,.2f} vs Vaciado={d['val_v']:,.2f}.")
+                    registrar_error(
+                        "Factor 1-C (Insumo)", d["coord"], hoja_modelo, d["fila"], d["col"], f"{d['val_excel']:,.2f}", round(d["val_v"], 2),
+                        f"Insumo '{d['etiqueta']}': capturaste {d['val_excel']:,.2f}, pero en el Vaciado reporta {d['val_v']:,.2f}."
+                    )
+            logs_pasos.append(f"**[Paso 5 — Factor 1-C]** {len(filas_ind_1c)} indicadores financieros auditados.")
 
-    escenario = simular_escenario_desde_comentario(wb_pre_val, hoja_modelo, sector_activo, comentario_analista)
-    correo_final = redactar_correo_alison(nombre_cliente, errores_llenado, ws_val, escenario)
+    # Detector de #REF! y vínculos externos rotos
+    for r in range(1, min(ws_val.max_row + 1, 130)):
+        for c in range(1, min(ws_val.max_column + 1, 70)):
+            coord_err = f"{openpyxl.utils.get_column_letter(c)}{r}"
+            val_c = str(ws_val.cell(r, c).value or "").strip()
+            form_c = str(ws_form.cell(r, c).value or "").strip()
+            if any(err in val_c.upper() for err in ["#REF!", "#VALUE!", "#VALOR!", "#NAME?", "#NOMBRE?", "#DIV/0!", "#N/A"]) or "#REF!" in form_c.upper():
+                alertas_informativas.append(f"Error de fórmula en celda {coord_err} ({val_c or '#REF!'}). Pega los valores numéricos directos sin vínculos externos.")
+            elif form_c.startswith("=") and re.search(r"\[\d+\]|\.xls", form_c, re.IGNORECASE):
+                alertas_informativas.append(f"Vínculo externo detectado en {coord_err} ({form_c}). Conviene pegarlo como valor fijo.")
 
+    # Generar Excel corregido
     excel_corregido_bytes = None
     if errores_llenado and not es_pre_pdf:
         wb_salida = openpyxl.load_workbook(path_pre, data_only=False)
@@ -615,41 +481,40 @@ def ejecutar_auditoria_completa(path_vac, path_buro, path_pre, path_tif, comenta
     return {
         "nombre_cliente": nombre_cliente,
         "hoja_modelo": hoja_modelo,
+        "sector": sector_activo,
         "calif": calif_final,
         "reserva": res_final,
         "errores": errores_llenado,
-        "alertas": alertas_sin_impacto,
+        "alertas": list(dict.fromkeys(alertas_informativas)),
         "logs": logs_pasos,
-        "correo": correo_final,
         "excel_bytes": excel_corregido_bytes,
-        "escenario": escenario,
     }
 
 
-st.title("📊 Validador Automático de Precalificación (CUB)")
-st.markdown("Sube los archivos del expediente para validar automáticamente el llenado del modelo y generar el dictamen.")
+# -------------------------------------------------------------------------
+# INTERFAZ VISUAL PARA EL ANALISTA
+# -------------------------------------------------------------------------
+st.title("🛡️ Autocontrol de Precalificación (CUB)")
+st.caption("🔒 **Privacidad garantizada:** Los archivos se procesan exclusivamente en memoria temporal y se eliminan automáticamente al finalizar. Ningún expediente se guarda en base de datos.")
 
+k = st.session_state["uploader_key"]
 col1, col2, col3, col4 = st.columns(4)
 with col1:
-    up_vaciado = st.file_uploader("1️⃣ Vaciado / EEFF", type=["xlsx", "xlsm", "pdf"])
+    up_vaciado = st.file_uploader("1️⃣ Vaciado / EEFF", type=["xlsx", "xlsm", "pdf"], key=f"vac_{k}", help="Excel de vaciado o estados financieros en PDF")
 with col2:
-    up_buro = st.file_uploader("2️⃣ Buró de Crédito (PDF)", type=["pdf"])
+    up_buro = st.file_uploader("2️⃣ Buró de Crédito (PDF)", type=["pdf"], key=f"bur_{k}", help="Reporte de Buró de Crédito Persona Moral")
 with col3:
-    up_precalif = st.file_uploader("3️⃣ Modelo Precalificación", type=["xlsx", "xlsm", "pdf"])
+    up_precalif = st.file_uploader("3️⃣ Modelo Precalificación", type=["xlsx", "xlsm", "pdf"], key=f"pre_{k}", help="Plantilla de Precalificación IFRS9 / CUB")
 with col4:
-    up_tif = st.file_uploader("4️⃣ Gobierno Corp. (Opcional)", type=["tif", "tiff"])
+    up_tif = st.file_uploader("4️⃣ Gobierno Corp. (Opcional)", type=["tif", "tiff"], key=f"tif_{k}", help="Documento escaneado .tif de estructura accionaria/gobierno")
 
-comentario_opcional = st.text_area(
-    "💬 Comentario del ejecutivo / aclaración de Buró (Opcional — solo para simular doble escenario)",
-    placeholder="Pega aquí el párrafo si hay alguna aclaración de buró o quita...",
-    height=80
-)
-
-if st.button("🔍 Auditar Precalificación", type="primary", use_container_width=True):
+st.markdown("")
+if st.button("🔍 Validar mi Precalificación", type="primary", use_container_width=True):
     if not (up_vaciado and up_buro and up_precalif):
-        st.error("⚠️ Por favor sube los 3 archivos obligatorios: Vaciado/EEFF, Buró de Crédito y Modelo de Precalificación.")
+        st.error("⚠️ Sube los 3 archivos obligatorios (Vaciado/EEFF, Buró de Crédito y Modelo de Precalificación) para iniciar la validación.")
     else:
-        with st.spinner("Auditando expediente contra normativa CUB..."):
+        with st.spinner("Verificando datos contables, claves SCIAN, Buró y rangos CUB..."):
+            # Carpeta temporal que se destruye automáticamente al terminar este bloque 'with'
             with tempfile.TemporaryDirectory() as tmpdir:
                 p_vac = os.path.join(tmpdir, up_vaciado.name)
                 p_bur = os.path.join(tmpdir, up_buro.name)
@@ -663,49 +528,61 @@ if st.button("🔍 Auditar Precalificación", type="primary", use_container_widt
                     p_tif = os.path.join(tmpdir, up_tif.name)
                     with open(p_tif, "wb") as f: f.write(up_tif.getbuffer())
 
-                res = ejecutar_auditoria_completa(p_vac, p_bur, p_pre, p_tif, comentario_opcional)
+                st.session_state["resultado_auditoria"] = ejecutar_auditoria_analista(p_vac, p_bur, p_pre, p_tif)
 
-        st.divider()
-        st.subheader(f"🏢 Expediente: {res['nombre_cliente']}")
+# Renderizar resultados si existen en la sesión activa
+res = st.session_state["resultado_auditoria"]
+if res:
+    st.divider()
+    st.subheader(f"🏢 {res['nombre_cliente']}")
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Anexo Aplicable", res["hoja_modelo"])
-        m2.metric("Calificación Actual", res["calif"])
-        m3.metric("% Reserva", res["reserva"])
-        m4.metric("Errores Detectados", len(res["errores"]))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Anexo Evaluado", res["hoja_modelo"])
+    m2.metric("Sector Activo", res["sector"] or "N/D")
+    m3.metric("Calificación (Archivo)", f"{res['calif']} ({res['reserva']})")
+    m4.metric("Correcciones Requeridas", len(res["errores"]))
 
-        if res["escenario"]:
-            esc = res["escenario"]
-            st.info(
-                f"📊 **Simulación Doble Escenario:** Actual = **{esc['calif_act']}** ({esc['res_act']}, {esc['puntaje_act']} pts) "
-                f"➡️ Ajustado = **{esc['calif_nueva']}** ({esc['res_nueva']}, {esc['puntaje_nuevo']} pts | Delta: +{esc['delta']} pts)"
-            )
-
-        if not res["errores"]:
-            st.success("✅ La precalificación se llenó correctamente. No se requieren modificaciones.")
-        else:
-            st.warning(f"⚠️ Se detectaron **{len(res['errores'])}** error(es) de llenado:")
-            for idx, err in enumerate(res["errores"], 1):
-                st.write(f"**{idx}.** {err['motivo']}")
+    if not res["errores"]:
+        st.success("✅ **¡Precalificación aprobada!** Todos los campos y rangos coinciden con la documentación soporte. Ya puedes enviarla.")
+    else:
+        st.error(f"❌ **Se detectaron {len(res['errores'])} punto(s) por corregir antes de enviar:**")
+        tabla_datos = [
+            {
+                "Bloque": e["bloque"],
+                "Celda": e["celda"],
+                "Valor Capturado": e["val_actual"],
+                "Valor Correcto (CUB)": str(e["nuevo_val"]),
+                "Detalle": e["motivo"]
+            }
+            for e in res["errores"]
+        ]
+        st.dataframe(tabla_datos, use_container_width=True, hide_index=True)
 
         if res["excel_bytes"]:
             nombre_limpio = re.sub(r'[\\/*?:"<>|]', "", res["nombre_cliente"]).strip()
             st.download_button(
-                label="⬇️ Descargar Excel Corregido",
+                label="⬇️ Descargar Excel con Correcciones Aplicadas",
                 data=res["excel_bytes"],
                 file_name=f"Modelo Precalificación - {nombre_limpio} (Corregido).xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary"
             )
+            st.caption("💡 *Nota: Abre el archivo descargado en Excel y guárdalo para que se actualicen las fórmulas de puntaje y reserva.*")
 
-        st.subheader("✉️ Borrador de Correo Listo para Copiar")
-        st.code(res["correo"], language=None)
+    if res["alertas"]:
+        with st.expander(f"⚠️ Ver {len(res['alertas'])} observación(es) preventiva(s) (no bloquean envío)"):
+            for al in res["alertas"]:
+                st.warning(al)
 
-        with st.expander("🔎 Ver trazabilidad técnica paso a paso"):
-            for log in res["logs"]:
-                st.markdown(f"- {log}")
-            if res["alertas"]:
-                st.markdown("**Alertas informativas sin impacto en puntaje:**")
-                for al in res["alertas"]:
-                    st.markdown(f"- ⚠️ {al}")
-                    
+    with st.expander("🔎 Ver resumen de validación paso a paso"):
+        for log in res["logs"]:
+            st.markdown(f"- {log}")
+
+    st.divider()
+    st.button(
+        "🗑️ Borrar expediente de memoria y limpiar pantalla",
+        on_click=limpiar_memoria_y_reiniciar,
+        use_container_width=True,
+        help="Elimina inmediatamente todos los archivos cargados y resultados de esta sesión."
+    )
+    
